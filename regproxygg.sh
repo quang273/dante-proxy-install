@@ -46,30 +46,33 @@ EOF
         systemctl restart danted" \
       --network-tier=STANDARD \
       --boot-disk-size=10GB \
-      --boot-disk-type=pd-balanced &  # ✅ CHẠY NỀN (đa luồng)
-    
-    sleep 0.5  # giảm tải API gọi liên tục
+      --boot-disk-type=pd-balanced &
+
+    sleep 0.5
   done
 done
 
-wait  # ✅ Đợi tất cả VM tạo xong
+wait
+sleep 15
 
-sleep 15  # chờ VM khởi động
-
-# ✅ Lấy IP các VM và gửi về Telegram
+# ✅ Lấy IP các VM
 for region in "${REGIONS[@]}"; do
   for i in $(seq 1 4); do
     INSTANCE_NAME="proxy-$(echo $region | awk -F'-' '{print $3}')-$i"
     IP=$(gcloud compute instances describe "$INSTANCE_NAME" \
          --zone="${region}-a" --project="$PROJECT_ID" \
          --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
-    
+
     if [[ -n "$IP" ]]; then
       LINE="$IP:$PORT:$USERNAME:$PASSWORD"
-      echo "$LINE" | tee -a proxies/all_proxy.txt
+      echo "$LINE"
       ALL_PROXY+="$LINE"$'\n'
     fi
   done
 done
 
+# ✅ Ghi toàn bộ proxy vào file (ghi đè)
+echo "$ALL_PROXY" > proxies/all_proxy.txt
+
+# ✅ Gửi về Telegram
 send_to_telegram "$ALL_PROXY"
