@@ -24,12 +24,21 @@ while (( ${#created[@]} < NUM_TARGET )); do
   if gcloud projects create "$PROJECT_ID" --name="$PROJECT_ID" &>/dev/null; then
     BILLING_ACCOUNT=$(gcloud beta billing accounts list --format="value(ACCOUNT_ID)" | head -n1)
     gcloud beta billing projects link "$PROJECT_ID" --billing-account="$BILLING_ACCOUNT"
+
+    echo "🔄 Đang bật API cho project: $PROJECT_ID"
+    gcloud services enable compute.googleapis.com \
+                             iam.googleapis.com \
+                             cloudresourcemanager.googleapis.com \
+                             serviceusage.googleapis.com \
+                             --project="$PROJECT_ID"
+    echo "✅ Đã bật đủ API cho: $PROJECT_ID"
+
     created+=("$PROJECT_ID")
     echo "✅ Tạo thành công: $PROJECT_ID"
   else
     echo "❌ Tạo thất bại: $PROJECT_ID - tiếp tục..."
   fi
-  # Hết quota?
+
   if (( attempts > NUM_TARGET*3 )); then
     send_to_telegram "⚠️ Không tạo đủ $NUM_TARGET project sau $attempts lần – có thể hết quota"
     break
