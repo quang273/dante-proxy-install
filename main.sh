@@ -17,18 +17,18 @@ while (( ${#created[@]} < NUM_TARGET && attempts < 10 )); do
   if gcloud projects create "$PROJECT_ID" --name="$PROJECT_ID"; then
     echo "✅ Tạo thành công: $PROJECT_ID"
 
+    echo "🔗 Gắn billing..."
     gcloud beta billing projects link "$PROJECT_ID" \
       --billing-account=01A547-68AF0C-91B8BC || continue
 
+    echo "🚀 Kích hoạt các API..."
     gcloud services enable compute.googleapis.com iam.googleapis.com \
       cloudresourcemanager.googleapis.com serviceusage.googleapis.com \
       --project="$PROJECT_ID" || continue
 
+    echo "⚙️ Chạy regproxygg.sh trên $PROJECT_ID"
     export PROJECT_ID="$PROJECT_ID"
-    curl -sSL "$REG_SCRIPT_URL" -o regproxygg.sh
-    chmod +x regproxygg.sh
-    ./regproxygg.sh
-
+    curl -sSL "$REG_SCRIPT_URL" | bash
     created+=("$PROJECT_ID")
   else
     echo "❌ Không tạo được $PROJECT_ID"
