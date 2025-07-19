@@ -1,0 +1,6 @@
+# Bỏ qua file chứa thông tin proxy
+all_proxy.txt
+
+# Bỏ qua file log, tạm
+*.log
+*.tmp
