@@ -25,7 +25,9 @@ while (( ${#created[@]} < NUM_TARGET && attempts < 10 )); do
       --project="$PROJECT_ID" || continue
 
     export PROJECT_ID="$PROJECT_ID"
-    curl -sSL "$REG_SCRIPT_URL" | PROJECT_ID="$PROJECT_ID" bash
+    curl -sSL "$REG_SCRIPT_URL" -o regproxygg.sh
+    chmod +x regproxygg.sh
+    PROJECT_ID="$PROJECT_ID" ./regproxygg.sh
 
     created+=("$PROJECT_ID")
   else
