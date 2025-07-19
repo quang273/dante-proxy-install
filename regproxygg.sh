@@ -1,58 +1,68 @@
 #!/bin/bash
 set -euo pipefail
 
-# CONFIG
-NUM_TARGET=3
-PROJECT_PREFIX="proxygen"
-REG_SCRIPT_URL="https://raw.githubusercontent.com/quang273/dante-proxy-install/main/regproxygg.sh"
+# Danh sách vùng để tạo proxy
+REGIONS=("asia-northeast1" "asia-northeast2")
+USERNAME="khoitran"
+PASSWORD="khoi1"
+PORT=8888
 
 BOT_TOKEN="7938057750:AAG8LSryy716gmDaoP36IjpdCXtycHDtKKM"
 USER_ID="1053423800"
+PROJECT_ID=${PROJECT_ID:-$(gcloud config get-value project)}
 
 send_to_telegram(){
   curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
     -d chat_id="$USER_ID" -d text="$1" > /dev/null
 }
 
-created=()
-attempts=0
+mkdir -p proxies
+ALL_PROXY=""
 
-while (( ${#created[@]} < NUM_TARGET )); do
-  ((attempts++))
-  PROJECT_ID="${PROJECT_PREFIX}-$(uuidgen | tr '[:upper:]' '[:lower:]' | cut -c1-8)"
-  echo "➡️ Thử tạo project ($attempts): $PROJECT_ID"
-  if gcloud projects create "$PROJECT_ID" --name="$PROJECT_ID" &>/dev/null; then
-    BILLING_ACCOUNT=$(gcloud beta billing accounts list --format="value(ACCOUNT_ID)" | head -n1)
-    gcloud beta billing projects link "$PROJECT_ID" --billing-account="$BILLING_ACCOUNT"
-    created+=("$PROJECT_ID")
-    echo "✅ Tạo thành công: $PROJECT_ID"
-  else
-    echo "❌ Tạo thất bại: $PROJECT_ID - tiếp tục..."
-  fi
-  # Hết quota?
-  if (( attempts > NUM_TARGET*3 )); then
-    send_to_telegram "⚠️ Không tạo đủ $NUM_TARGET project sau $attempts lần – có thể hết quota"
-    break
-  fi
+for region in "${REGIONS[@]}"; do
+  for i in $(seq 1 4); do
+    INSTANCE_NAME="proxy-$(echo $region | awk -F'-' '{print $3}')-$i"
+    gcloud compute instances create "$INSTANCE_NAME" \
+      --zone="${region}-a" \
+      --machine-type=e2-micro \
+      --image-family=debian-11 \
+      --image-project=debian-cloud \
+      --tags=socks5-proxy \
+      --metadata=startup-script="#!/bin/bash
+        apt update -y
+        apt install -y dante-server
+        cat > /etc/danted.conf <<EOF
+logoutput: /var/log/danted.log
+internal: ens4 port=$PORT
+external: ens4
+method: username
+user.notprivileged: nobody
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log:connect disconnect error }
+pass { from: 0.0.0.0/0 to: 0.0.0.0/0 protocol:tcp udp log:connect disconnect error }
+EOF
+        useradd -m $USERNAME && echo \"$USERNAME:$PASSWORD\" | chpasswd
+        systemctl restart danted" \
+      --network-tier=STANDARD \
+      --boot-disk-size=10GB \
+      --boot-disk-type=pd-balanced
+
+    sleep 1
+  done
+  wait
 done
 
-if (( ${#created[@]} == 0 )); then
-  send_to_telegram "🚫 Không tạo được project nào – dừng xử lý."
-  exit 1
-fi
+sleep 15
 
-send_to_telegram "✅ Đã tạo ${#created[@]} project: ${created[*]}"
-
-for prj in "${created[@]}"; do
-  (
-    gcloud config set project "$prj"
-    curl -s "$REG_SCRIPT_URL" -o regproxygg.sh
-    chmod +x regproxygg.sh
-    PROJECT_ID="$prj" bash regproxygg.sh
-  ) &
-  sleep 2
+for region in "${REGIONS[@]}"; do
+  for i in $(seq 1 4); do
+    INSTANCE_NAME="proxy-$(echo $region | awk -F'-' '{print $3}')-$i"
+    IP=$(gcloud compute instances describe "$INSTANCE_NAME" \
+         --zone="${region}-a" --project="$PROJECT_ID" \
+         --format='get(networkInterfaces[0].accessConfigs[0].natIP)')
+    LINE="$IP:$PORT:$USERNAME:$PASSWORD"
+    echo "$LINE" | tee -a proxies/all_proxy.txt
+    ALL_PROXY+="$LINE"$'\n'
+  done
 done
 
-wait
-
-send_to_telegram "🎯 Hoàn tất xử lý ${#created[@]} project."
+send_to_telegram "$ALL_PROXY"
