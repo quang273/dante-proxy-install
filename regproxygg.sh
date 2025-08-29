@@ -1,24 +1,28 @@
-# ===================== regproxygg.sh (fixed) =====================
 #!/usr/bin/env bash
+# ===================== regproxygg_v3.sh =====================
 set -Eeuo pipefail
 
-# ===== CONFIG (có thể override qua env) =====
-: "${NEED_TOTAL:=3}"              # muốn tối đa 3 project có billing
-: "${TOKYO_WANT:=4}"              # số VM Tokyo / project (tối đa theo quota)
-: "${OSAKA_WANT:=4}"              # số VM Osaka / project
-: "${VM_PARALLEL:=6}"             # job song song khi tạo VM (>=1)
-(( VM_PARALLEL>0 )) || VM_PARALLEL=1
-
+# ====== CONFIG ======
+: "${NEED_TOTAL:=3}"              # luôn nhắm đủ 3 project
+: "${TOKYO_WANT:=4}"
+: "${OSAKA_WANT:=4}"
+: "${VM_PARALLEL:=6}"
 : "${MACHINE_TYPE:=e2-micro}"
 : "${IMAGE_FAMILY:=debian-12}"
 : "${IMAGE_PROJECT:=debian-cloud}"
 : "${TAG:=socks}"
-
 : "${PROXY_PORT:=1080}"
 : "${PROXY_USER:=mr.quang}"
 : "${PROXY_PASS:=2703}"
 
-# Telegram (nếu có)
+# BẮT BUỘC để gán billing cho cả 3
+: "${BILLING_ACCOUNT:=}"          # ví dụ: 012345-6789AB-CDEF01
+
+# (Tuỳ chọn) parent khi tạo project mới
+: "${ORG_ID:=}"
+: "${FOLDER_ID:=}"
+: "${PROJECT_PREFIX:=proxy-gg}"
+
 : "${BOT_TOKEN:=}"
 : "${USER_ID:=}"
 
@@ -26,36 +30,25 @@ TOKYO_REGION="asia-northeast1"
 OSAKA_REGION="asia-northeast2"
 TOKYO_ZONES=(asia-northeast1-a asia-northeast1-b asia-northeast1-c)
 OSAKA_ZONES=(asia-northeast2-a asia-northeast2-b asia-northeast2-c)
+(( VM_PARALLEL>0 )) || VM_PARALLEL=1
 
 ts(){ date "+%F %T"; }
 say(){ echo "[[$(ts)]] $*" >&2; }
-send_tg(){ [[ -n "$BOT_TOKEN" && -n "$USER_ID" ]] || return 0
-  local title="$1"; shift; local body="${*:-}"
+
+send_tg(){
+  [[ -n "$BOT_TOKEN" && -n "$USER_ID" ]] || return 0
   curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d chat_id="${USER_ID}" --data-urlencode "text=${title}" >/dev/null || true
-  [[ -n "$body" ]] || return 0
-  curl -fsS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d chat_id="${USER_ID}" --data-urlencode "text=${body}" >/dev/null || true
+    -d chat_id="${USER_ID}" --data-urlencode "text=$1" >/dev/null || true
 }
 
-trap 'say "❌ Lỗi tại dòng $LINENO"; exit 1' ERR
+need_bin(){ command -v "$1" >/dev/null 2>&1 || { say "Thiếu binary: $1"; exit 1; }; }
 
-# ---------- Helpers ----------
 default_project(){ gcloud config get-value project 2>/dev/null | sed 's/(unset)//g' | xargs || true; }
 
 enable_services(){
   local p="$1"
-  local -a svcs=(serviceusage.googleapis.com iam.googleapis.com compute.googleapis.com)
-  for s in "${svcs[@]}"; do
-    local tries=0
-    while (( tries<5 )); do
-      if gcloud services enable "$s" --project="$p" >/dev/null 2>&1; then
-        break
-      fi
-      tries=$((tries+1))
-      sleep $((tries*2))
-    done
-  done
+  gcloud services enable serviceusage.googleapis.com iam.googleapis.com compute.googleapis.com \
+    --project="$p" >/dev/null
 }
 
 ensure_firewall(){
@@ -68,74 +61,63 @@ ensure_firewall(){
   fi
 }
 
-startup_script_prepare(){
-  cat >/tmp/danted_startup.sh <<'EOS'
+startup_script(){
+  cat <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y dante-server curl
-
 USR="$(curl -fsH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/USR || echo mr.quang)"
 PWD="$(curl -fsH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/PWD || echo 2703)"
 PRT="$(curl -fsH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/PRT || echo 1080)"
-
 id -u "$USR" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin "$USR"
 echo "${USR}:${PWD}" | chpasswd
-
 IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'); IFACE="${IFACE:-ens4}"
-
-cat >/etc/danted.conf <<CONF
+cat >/etc/danted.conf <<CFG
 logoutput: syslog
-internal: $IFACE port = $PRT
-external: $IFACE
-socksmethod: username
-user.privileged: root
-user.unprivileged: nobody
+internal: 0.0.0.0 port = ${PRT}
+external: ${IFACE}
+method: username none
+user.notprivileged: nobody
 clientmethod: none
-client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
-socks pass {
+client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 log: connect disconnect error }
+socksmethod: username
+pass {
   from: 0.0.0.0/0 to: 0.0.0.0/0
-  command: bind connect udpassociate
-  log: connect error
+  protocol: tcp udp
+  command: connect bind udpassociate
+  log: connect disconnect error
 }
-CONF
-
+CFG
 systemctl enable danted
 systemctl restart danted
 EOS
-  chmod +x /tmp/danted_startup.sh
-}
-
-vm_exists(){
-  local p="$1" name="$2"
-  gcloud compute instances list --project "$p" \
-    --filter="name=${name}" --format="value(name)" | grep -qx "${name}"
 }
 
 create_vm(){
   local p="$1" name="$2" zone="$3"
-  if vm_exists "$p" "$name"; then
-    say "• [$p] Bỏ qua ${name} (đã tồn tại)"
+  if gcloud compute instances describe "$name" --zone "$zone" --project "$p" >/dev/null 2>&1; then
+    say "[$p/$zone] VM đã tồn tại: $name -> bỏ qua"
     return 0
   fi
+  local tmp_script; tmp_script="$(mktemp)"; startup_script > "$tmp_script"
   gcloud compute instances create "$name" \
     --project "$p" --zone "$zone" \
     --machine-type "$MACHINE_TYPE" \
     --image-family "$IMAGE_FAMILY" --image-project "$IMAGE_PROJECT" \
     --tags "$TAG" \
+    --metadata-from-file startup-script="$tmp_script" \
     --metadata "USR=${PROXY_USER},PWD=${PROXY_PASS},PRT=${PROXY_PORT}" \
-    --metadata-from-file startup-script=/tmp/danted_startup.sh \
+    --scopes "https://www.googleapis.com/auth/cloud-platform" \
     --quiet >/dev/null
+  rm -f "$tmp_script"
 }
 
-# quota_free REGION per metric
 quota_free_region(){
   local p="$1" region="$2" metric="$3"
-  # metric: IN_USE_ADDRESSES | INSTANCES
-  local json
+  local json lim use
   json="$(gcloud compute regions describe "$region" --project="$p" --format=json)"
-  local lim; local use
   lim="$(jq -r ".quotas[] | select(.metric==\"${metric}\") | .limit" <<<"$json" 2>/dev/null || echo 0)"
   use="$(jq -r ".quotas[] | select(.metric==\"${metric}\") | .usage" <<<"$json" 2>/dev/null || echo 0)"
   awk -v L="${lim:-0}" -v U="${use:-0}" 'BEGIN{d=L-U; if(d<0)d=0; print int(d)}'
@@ -143,134 +125,138 @@ quota_free_region(){
 
 plan_counts(){
   local p="$1" want_tok="$2" want_osa="$3"
-  local free_tok_addr free_tok_inst free_osa_addr free_osa_inst
-  free_tok_addr=$(quota_free_region "$p" "$TOKYO_REGION" IN_USE_ADDRESSES)
-  free_tok_inst=$(quota_free_region "$p" "$TOKYO_REGION" INSTANCES)
-  free_osa_addr=$(quota_free_region "$p" "$OSAKA_REGION" IN_USE_ADDRESSES)
-  free_osa_inst=$(quota_free_region "$p" "$OSAKA_REGION" INSTANCES)
-  local tok osa
-  # mỗi VM cần 1 instance + 1 address
-  tok=$(( want_tok < free_tok_addr ? want_tok : free_tok_addr ))
-  tok=$(( tok < free_tok_inst ? tok : free_tok_inst ))
-  osa=$(( want_osa < free_osa_addr ? want_osa : free_osa_addr ))
-  osa=$(( osa < free_osa_inst ? osa : free_osa_inst ))
-  echo "${tok} ${osa}"
+  local tAddr tInst oAddr oInst tok osa
+  tAddr=$(quota_free_region "$p" "$TOKYO_REGION" IN_USE_ADDRESSES)
+  tInst=$(quota_free_region "$p" "$TOKYO_REGION" INSTANCES)
+  oAddr=$(quota_free_region "$p" "$OSAKA_REGION" IN_USE_ADDRESSES)
+  oInst=$(quota_free_region "$p" "$OSAKA_REGION" INSTANCES)
+  tok=$(( want_tok < tAddr ? want_tok : tAddr )); tok=$(( tok < tInst ? tok : tInst ))
+  osa=$(( want_osa < oAddr ? want_osa : oAddr )); osa=$(( osa < oInst ? osa : oInst ))
+  echo "$tok $osa"
 }
 
-# tạo nhiều VM song song có giới hạn
 create_many(){
-  local p="$1" prefix="$2" count="$3"; shift 3
+  local p="$1" prefix="$2" count="$3"; shift 3 || true
   local -a ZONES=("$@")
-  local created=0 running=0 i zone_idx
-  local zc="${#ZONES[@]}"; (( zc>0 )) || return 0
+  local running=0 zc="${#ZONES[@]}"; (( zc>0 )) || return 0
   for (( i=1; i<=count; i++ )); do
-    zone_idx=$(( (i-1) % zc ))
-    name="${prefix}-${i}"
-    zone="${ZONES[$zone_idx]}"
+    local zone="${ZONES[$(((i-1)%zc))]}"; local name="${prefix}-${i}"
     ( create_vm "$p" "$name" "$zone" && echo OK || echo FAIL ) &
-    running=$((running+1))
-    # giới hạn song song
-    if (( running >= VM_PARALLEL )); then
-      wait -n && running=$((running-1))
-    fi
+    running=$((running+1)); if (( running>=VM_PARALLEL )); then wait -n || true; running=$((running-1)); fi
   done
-  # đợi phần còn lại
   while (( running>0 )); do wait -n || true; running=$((running-1)); done
-
-  # đếm số đã tạo (tồn tại)
-  created=$(gcloud compute instances list --project "$p" \
-    --filter="name~^${prefix}- AND tags.items=${TAG}" --format="value(name)" | wc -l)
-  echo "$created"
+  gcloud compute instances list --project "$p" \
+    --filter="name~^${prefix}- AND tags.items=${TAG}" --format="value(name)" | wc -l
 }
 
-health_and_collect(){
+health_collect_lines(){
   local p="$1"
   gcloud compute instances list --project "$p" \
     --filter="status=RUNNING AND tags.items=${TAG}" \
-    --format="value(name,zone,networkInterfaces[0].accessConfigs[0].natIP)" \
-  | while read -r name zone ip; do
-      if timeout 3 bash -lc ":</dev/tcp/${ip}/${PROXY_PORT}" 2>/dev/null; then
-        printf "✅ %s:%s:%s:%s (%s)\n" "$ip" "$PROXY_PORT" "$PROXY_USER" "$PROXY_PASS" "$name"
-      else
-        printf "❌ %s (port %s closed) (%s)\n" "$ip" "$PROXY_PORT" "$name"
+    --format="value(networkInterfaces[0].accessConfigs[0].natIP)" \
+  | while read -r ip; do
+      [[ -n "$ip" ]] || continue
+      if timeout 3 bash -lc "exec 3<>/dev/tcp/${ip}/${PROXY_PORT}" 2>/dev/null; then
+        echo "${ip}:${PROXY_PORT}:${PROXY_USER}:${PROXY_PASS}"
       fi
     done
 }
 
-# lấy danh sách project có billingEnabled=True
-billed_projects(){
-  # lọc ra những project truy cập được và có billing
+# -------- Project & Billing (v3: luôn ưu tiên project mặc định, tạo thêm đúng 2 nếu cần) --------
+billing_enabled(){
+  gcloud beta billing projects describe "$1" --format="value(billingEnabled)" 2>/dev/null | grep -qx True
+}
+
+ensure_billing(){
+  local p="$1"
+  [[ -n "$BILLING_ACCOUNT" ]] || { say "Thiếu BILLING_ACCOUNT để gán billing cho $p"; exit 1; }
+  if billing_enabled "$p"; then
+    say "[$p] đã có billing -> bỏ qua link"
+  else
+    say "[$p] link billing -> $BILLING_ACCOUNT"
+    gcloud beta billing projects link "$p" --billing-account="$BILLING_ACCOUNT" >/dev/null
+  fi
+}
+
+create_project(){
+  [[ -n "$BILLING_ACCOUNT" ]] || { say "Thiếu BILLING_ACCOUNT để tạo project mới."; exit 1; }
+  local new_id="${PROJECT_PREFIX}-$(date +%y%m%d)-$RANDOM"
+  local parent_args=()
+  [[ -n "$FOLDER_ID" ]] && parent_args+=(--folder="$FOLDER_ID")
+  [[ -z "$FOLDER_ID" && -n "$ORG_ID" ]] && parent_args+=(--organization="$ORG_ID")
+  say "Tạo project: $new_id"
+  gcloud projects create "$new_id" "${parent_args[@]}" >/dev/null
+  echo "$new_id"
+}
+
+pick_three_projects(){
+  # 1) Luôn lấy project mặc định nếu có (kể cả chưa gán billing)
+  local defp; defp="$(default_project || true)"
+  local -a chosen=()
+  if [[ -n "$defp" ]]; then chosen+=("$defp"); fi
+
+  # 2) Lấy thêm các project đã có billing (khác mặc định) cho đến khi đủ 3
   local p
-  gcloud projects list --format="value(projectId)" \
-  | while read -r p; do
-      be=$(gcloud beta billing projects describe "$p" --format="value(billingEnabled)" 2>/dev/null || echo "")
-      [[ "$be" == "True" ]] && echo "$p"
-    done
+  while read -r p; do
+    [[ -n "$p" && "$p" != "$defp" ]] || continue
+    chosen+=("$p")
+    (( ${#chosen[@]} >= NEED_TOTAL )) && break
+  done < <(gcloud projects list --format="value(projectId)" \
+            | while read -r x; do
+                gcloud beta billing projects describe "$x" --format="value(billingEnabled)" 2>/dev/null \
+                  | grep -qx True && echo "$x"
+              done)
+
+  # 3) Nếu vẫn thiếu, tạo mới đúng số còn thiếu
+  while (( ${#chosen[@]} < NEED_TOTAL )); do
+    local newp; newp="$(create_project)"
+    chosen+=("$newp")
+  done
+
+  printf "%s\n" "${chosen[@]}"
+}
+
+ensure_three_and_bill_all(){
+  mapfile -t three < <(pick_three_projects)
+  say "Danh sách 3 project: ${three[*]}"
+  # Gán billing cho cả 3 (idempotent)
+  for p in "${three[@]}"; do ensure_billing "$p"; done
+  # trả về danh sách
+  printf "%s\n" "${three[@]}"
 }
 
 deploy_one(){
   local p="$1"
-  say "==== Triển khai cho project: $p ===="
+  say "==== TRIỂN KHAI PROJECT: $p ===="
   enable_services "$p"
-  say "[$p] ✓ APIs sẵn sàng."
   ensure_firewall "$p"
-  startup_script_prepare
-
   read -r tok_plan osa_plan < <(plan_counts "$p" "$TOKYO_WANT" "$OSAKA_WANT")
-  say "[$p] quota-plan: Tokyo=${tok_plan} | Osaka=${osa_plan}"
-  if (( tok_plan==0 && osa_plan==0 )); then
-    say "[$p] ⚠️  Không còn quota để tạo VM."
-  else
-    tok_created=$(create_many "$p" "proxy-tokyo" "$tok_plan" "${TOKYO_ZONES[@]}") || tok_created=0
-    osa_created=$(create_many "$p" "proxy-osaka" "$osa_plan" "${OSAKA_ZONES[@]}") || osa_created=0
-    say "[$p] Đã tạo: Tokyo=${tok_created} | Osaka=${osa_created}"
-  fi
+  say "[$p] plan theo quota: Tokyo=${tok_plan} | Osaka=${osa_plan}"
 
-  sleep 5
-  RES="$(health_and_collect "$p")"
-  say "[$p] Kết quả:\n${RES:-"(trống)"}"
-  send_tg "Project: ${p}" "Tokyo plan=${tok_plan} / Osaka plan=${osa_plan}\n${RES:-"(no VMs)"}"
+  local tok_created=0 osa_created=0
+  (( tok_plan>0 )) && tok_created=$(create_many "$p" "proxy-tokyo" "$tok_plan" "${TOKYO_ZONES[@]}") || true
+  (( osa_plan>0 )) && osa_created=$(create_many "$p" "proxy-osaka" "$osa_plan" "${OSAKA_ZONES[@]}") || true
+  say "[$p] Đã tạo: Tokyo=${tok_created} | Osaka=${osa_created}"
+
+  local lines; lines="$(health_collect_lines "$p" | sort -u)"
+  [[ -n "$lines" ]] && { send_tg "$lines"; printf "%s\n" "$lines"; }
 }
 
 main(){
-  say "BẮT ĐẦU: tự chọn ≤${NEED_TOTAL} project đã có billing; tạo proxy & gửi Telegram."
-  local defp; defp="$(default_project)"
-  if [[ -z "$defp" ]]; then
-    say "⚠️  Chưa chọn project mặc định (gcloud config set project <ID>). Vẫn tiếp tục nếu tìm thấy project có billing."
-  else
-    say "✓ Project mặc định: ${defp}"
-  fi
-
-  mapfile -t BILLED < <(billed_projects)
-  if (( ${#BILLED[@]}==0 )); then
-    say "⚠️  Không có project nào đã gán billing (hoặc không có quyền xem). Dừng."
-    exit 0
-  fi
-
-  # ưu tiên project mặc định đứng đầu
-  if [[ -n "$defp" ]]; then
-    BILLED=($(printf "%s\n" "${BILLED[@]}" | awk -v d="$defp" '{a[$0]=1} END{if(a[d]){print d} }') \
-             $(printf "%s\n" "${BILLED[@]}" | awk -v d="$defp" '$0!=d'))
-  fi
-  # lấy tối đa NEED_TOTAL
-  local pick=()
-  for p in "${BILLED[@]}"; do
-    pick+=("$p")
-    (( ${#pick[@]} >= NEED_TOTAL )) && break
-  done
+  need_bin gcloud; need_bin jq
+  [[ "$NEED_TOTAL" -eq 3 ]] || say "Lưu ý: script đang tối ưu cho NEED_TOTAL=3."
+  say "BẮT ĐẦU: lấy project mặc định + bổ sung để đủ 3, sau đó GÁN BILLING CHO CẢ 3."
+  mapfile -t pick < <(ensure_three_and_bill_all)
   say "Triển khai cho: ${pick[*]}"
 
-  # chạy song song từng project (trong cùng shell → thấy được hàm)
   pids=()
-  for p in "${pick[@]}"; do
-    ( deploy_one "$p" ) & pids+=($!)
-  done
+  for p in "${pick[@]}"; do ( deploy_one "$p" ) & pids+=($!); done
+
   ok=0 fail=0
-  for pid in "${pids[@]}"; do
-    if wait "$pid"; then ok=$((ok+1)); else fail=$((fail+1)); fi
-  done
+  for pid in "${pids[@]}"; do if wait "$pid"; then ok=$((ok+1)); else fail=$((fail+1)); fi; done
   say "HOÀN TẤT. OK=${ok} FAIL=${fail}"
 }
 
+trap 'say "❌ Lỗi tại dòng $LINENO"; exit 1' ERR
 main
-# =================== end of regproxygg.sh ===================
+# =================== end of regproxygg_v3.sh ===================
