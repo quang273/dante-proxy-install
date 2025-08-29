@@ -1,136 +1,121 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-########################################
-# CẤU HÌNH NHANH (có thể override qua env)
-########################################
-BASE_PREFIX="${BASE_PREFIX:-socks-proj-}"   # tiền tố project phụ
-LABELS="${LABELS:-owner=proxy,env=prod}"
+########################
+# CẤU HÌNH NHANH
+########################
+# Prefix các project mới (nếu cần tạo thêm)
+BASE_PREFIX="${BASE_PREFIX:-socks-proj}"
+# Số project mục tiêu (2 hoặc 3). Nếu đã đủ & có billing thì KHÔNG tạo thêm.
+TARGET_PROJECTS="${TARGET_PROJECTS:-3}"
 
-# Proxy
-PORT="${PORT:-1080}"
-PROXY_USER="${PROXY_USER:-mr.quang}"
-PROXY_PASS="${PROXY_PASS:-2703}"
-
-# VM & Image
-MACHINE_TYPE="${MACHINE_TYPE:-e2-micro}"
-IMAGE_FAMILY="${IMAGE_FAMILY:-debian-12}"
-IMAGE_PROJECT="${IMAGE_PROJECT:-debian-cloud}"
+# VM / Proxy
+SOCKS_PORT="${SOCKS_PORT:-1080}"
+SOCKS_USER="${SOCKS_USER:-mr.quang}"
+SOCKS_PASS="${SOCKS_PASS:-2703}"
+MACHINE="${MACHINE:-e2-micro}"
+IMG_FAMILY="${IMG_FAMILY:-debian-12}"
+IMG_PROJECT="${IMG_PROJECT:-debian-cloud}"
 TAG="${TAG:-socks}"
 
-# Mỗi project: 2 Tokyo + 2 Osaka (để né quota 4 IP/region). Có thể đổi 1/1 nếu thiếu quota.
-TOKYO_COUNT="${TOKYO_COUNT:-2}"
-OSAKA_COUNT="${OSAKA_COUNT:-2}"
-VM_PARALLEL="${VM_PARALLEL:-6}"
-
+# Location & số lượng
 TOKYO_ZONES=("asia-northeast1-a" "asia-northeast1-b" "asia-northeast1-c")
 OSAKA_ZONES=("asia-northeast2-a" "asia-northeast2-b" "asia-northeast2-c")
+TOKYO_COUNT="${TOKYO_COUNT:-4}"
+OSAKA_COUNT="${OSAKA_COUNT:-4}"
+
+# Song song
+PROJECT_PARALLEL="${PROJECT_PARALLEL:-2}"   # số project xử lý song song
+VM_PARALLEL="${VM_PARALLEL:-8}"             # số VM tạo song song / project
 
 # Telegram
-: "${BOT_TOKEN:?Thiếu BOT_TOKEN}"
-: "${USER_ID:?Thiếu USER_ID}"
+BOT_TOKEN="${BOT_TOKEN:-}"
+USER_ID="${USER_ID:-}"
 
-# Billing: nếu không set BILLING_ACCOUNT, script sẽ auto-pick 1 account OPEN (nếu >1 sẽ chọn cái đầu tiên).
-BILLING_ACCOUNT="${BILLING_ACCOUNT:-}"
-
-########################################
+########################
 # TIỆN ÍCH
-########################################
+########################
 ts(){ date "+[%F %T]"; }
-say(){ echo "$(ts) $*"; }
+say(){ echo "[$(ts)] $*"; }
 need(){ command -v "$1" >/dev/null || { echo "Thiếu tool: $1"; exit 1; }; }
-need gcloud; need awk; need sed; need xargs; need curl
+need gcloud; need awk; need sed; need xargs; need curl; need tr; need shuf || true
 
-rand_suffix(){ tr -dc 'a-z0-9' </dev/urandom | head -c 6; }
-sanitize_id(){
-  local s="$1"
-  s="$(echo "$s" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-')"
-  s="${s#-}"; s="${s%-}"
-  while [[ "$s" == *"--"* ]]; do s="${s//--/-}"; done
-  [[ "$s" =~ ^[a-z] ]] || s="p$s"
-  s="${s:0:30}"; s="${s%-}"
-  [[ "${#s}" -lt 6 ]] && s="${s}$(rand_suffix)"
-  echo "$s"
-}
+trap 'echo "[ERR] died at line $LINENO"; exit 1' ERR
 
-telegram_send(){ local t="$1"; shift; local body="${*:-}";
+send_tg(){ 
+  local title="$1"; shift; local body="${1:-}"
+  [[ -n "$BOT_TOKEN" && -n "$USER_ID" ]] || return 0
   curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d chat_id="${USER_ID}" --data-urlencode "text=${t}" >/dev/null || true
+       -d chat_id="${USER_ID}" --data-urlencode "text=${title}" >/dev/null || true
   [[ -n "$body" ]] && curl -sS -X POST "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
-    -d chat_id="${USER_ID}" --data-urlencode "text=${body}" >/dev/null || true
-}
-
-ensure_billing_account(){
-  [[ -n "$BILLING_ACCOUNT" ]] && return 0
-  mapfile -t OPEN < <(gcloud billing accounts list --format="value(ACCOUNT_ID)" --filter="OPEN=True" || true)
-  if [[ ${#OPEN[@]} -eq 0 ]]; then
-    say "⚠️  Không tìm thấy Billing Account OPEN. Chỉ deploy trên project đã có billing."
-    return 0
-  fi
-  BILLING_ACCOUNT="${OPEN[0]}"
-  say "✓ Dùng Billing Account: $BILLING_ACCOUNT"
-}
-
-billing_enabled(){
-  local pid="$1"
-  gcloud beta billing projects describe "$pid" --format="value(billingEnabled)" 2>/dev/null | grep -qi '^true$'
-}
-
-link_billing_safe(){
-  local pid="$1"
-  if billing_enabled "$pid"; then
-    say "[$pid] Billing đã bật."
-    return 0
-  fi
-  [[ -z "$BILLING_ACCOUNT" ]] && { say "[$pid] Bỏ qua link billing (không có BILLING_ACCOUNT)."; return 1; }
-  if ! gcloud beta billing projects link "$pid" --billing-account="$BILLING_ACCOUNT" --quiet; then
-    say "[$pid] ⚠️  Link billing thất bại (có thể quota exceeded). Bỏ qua."
-    return 1
-  fi
-  say "[$pid] ✓ Đã link billing."
+       -d chat_id="${USER_ID}" --data-urlencode "text=${body}" >/dev/null || true
 }
 
 enable_core_apis(){
+  # Bật serviceusage, iam, compute — có check trước + retry/backoff nhẹ
   local pid="$1"
-  for svc in serviceusage.googleapis.com iam.googleapis.com compute.googleapis.com; do
-    local n=0
-    until gcloud services enable "$svc" --project="$pid" --quiet; do
-      n=$((n+1)); [[ $n -ge 6 ]] && { say "[$pid] ❌ enable $svc thất bại."; return 1; }
-      sleep 5
-    done
+  local svcs=(serviceusage.googleapis.com iam.googleapis.com compute.googleapis.com)
+
+  # check nhanh: compute đã bật chưa
+  if gcloud services list --enabled --project="$pid" \
+       --filter="NAME=compute.googleapis.com" --format="value(NAME)" \
+       | grep -q '^compute.googleapis.com$'; then
+    say "[$pid] ✓ APIs sẵn sàng (compute đã ENABLED)."
+    return 0
+  fi
+
+  say "[$pid] Enable core APIs…"
+  # enable cả 3 một lúc (gcloud cho phép nhiều service trong 1 lệnh)
+  local tries=0
+  until gcloud services enable "${svcs[@]}" --project="$pid" --quiet; do
+    tries=$((tries+1))
+    [[ $tries -ge 5 ]] && { say "[ERR] $pid: enable core APIs failed"; return 1; }
+    sleep $((2*tries))
   done
-  # chờ propagate
-  for _ in {1..12}; do
-    gcloud services list --enabled --project="$pid" \
-      --filter="NAME=compute.googleapis.com" --format="value(NAME)" | grep -q '^compute.googleapis.com$' && break
+
+  # poll đợi compute hiện ENABLED (tối đa ~60s)
+  for _ in {1..20}; do
+    if gcloud services list --enabled --project="$pid" \
+         --filter="NAME=compute.googleapis.com" --format="value(NAME)" | grep -q '^compute.googleapis.com$'; then
+      say "[$pid] ✓ APIs sẵn sàng."
+      return 0
+    fi
     sleep 3
   done
-  say "[$pid] ✓ APIs sẵn sàng."
+  say "[$pid] ⚠️ compute.googleapis.com chưa hiện ENABLED nhưng sẽ propagate tiếp."
 }
 
-create_firewall(){
+create_fw(){
   local pid="$1"
-  gcloud compute firewall-rules describe allow-socks --project="$pid" >/dev/null 2>&1 || \
-  gcloud compute firewall-rules create allow-socks \
-      --project="$pid" --allow="tcp:${PORT}" \
-      --direction=INGRESS --priority=1000 --network=default \
-      --source-ranges="0.0.0.0/0" --target-tags="$TAG" --quiet
+  if ! gcloud compute firewall-rules describe allow-socks --project="$pid" >/dev/null 2>&1; then
+    say "[$pid] Tạo firewall allow-socks tcp:${SOCKS_PORT}"
+    gcloud compute firewall-rules create allow-socks \
+      --project="$pid" --network=default \
+      --direction=INGRESS --priority=1000 --action=ALLOW \
+      --rules="tcp:${SOCKS_PORT}" \
+      --source-ranges=0.0.0.0/0 --target-tags="${TAG}" --quiet || true
+  fi
 }
 
-# Viết startup-script ra file tạm
-STARTUP_FILE="/tmp/danted_startup.sh"
-cat > "$STARTUP_FILE" <<'EOS'
+startup_script_file(){
+  # Viết ra file tạm để metadata-from-file dùng chắc chắn (tránh subshell function export)
+  local f="/tmp/danted_startup.$$.$RANDOM.sh"
+  cat >"$f" <<'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -y
 apt-get install -y dante-server curl
+
 USR="$(curl -fsH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/USR || echo mr.quang)"
 PWD="$(curl -fsH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/PWD || echo 2703)"
 PRT="$(curl -fsH 'Metadata-Flavor: Google' http://metadata.google.internal/computeMetadata/v1/instance/attributes/PRT || echo 1080)"
+
 id -u "$USR" >/dev/null 2>&1 || useradd -m -s /usr/sbin/nologin "$USR"
 echo "${USR}:${PWD}" | chpasswd
+
 IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}'); IFACE="${IFACE:-ens4}"
+
 cat >/etc/danted.conf <<CFG
 logoutput: stderr
 user.privileged: root
@@ -142,32 +127,33 @@ socksmethod: username
 client pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 socks  pass { from: 0.0.0.0/0 to: 0.0.0.0/0 }
 CFG
+
 systemctl enable danted || true
 systemctl restart danted || systemctl start danted || true
 EOS
-chmod +x "$STARTUP_FILE"
+  chmod +x "$f"
+  echo "$f"
+}
 
 create_vm(){
   local pid="$1" name="$2" zone="$3"
-  # nếu đã có -> trả IP
-  if gcloud compute instances describe "$name" --project="$pid" --zone="$zone" --format="value(name)" >/dev/null 2>&1; then
+  # Nếu tồn tại, trả IP luôn
+  if gcloud compute instances describe "$name" --project="$pid" --zone="$zone" \
+        --format="value(name)" >/dev/null 2>&1; then
     gcloud compute instances describe "$name" --project="$pid" --zone="$zone" \
-      --format="value(networkInterfaces[0].accessConfigs[0].natIP)"; return 0
+      --format="value(networkInterfaces[0].accessConfigs[0].natIP)"
+    return 0
   fi
-  # tạo mới
-  if ! gcloud compute instances create "$name" \
-      --project="$pid" --zone="$zone" \
-      --machine-type="$MACHINE_TYPE" \
-      --image-family="$IMAGE_FAMILY" --image-project="$IMAGE_PROJECT" \
-      --tags="$TAG" \
-      --metadata=USR="$PROXY_USER",PWD="$PROXY_PASS",PRT="$PORT" \
-      --metadata-from-file startup-script="$STARTUP_FILE" \
-      --quiet >/dev/null; then
-    # rớt vì quota region... trả rỗng
-    echo ""; return 0
-  fi
-  gcloud compute instances describe "$name" --project="$pid" --zone="$zone" \
-    --format="value(networkInterfaces[0].accessConfigs[0].natIP))" 2>/dev/null || true
+
+  local sfile; sfile="$(startup_script_file)"
+  gcloud compute instances create "$name" \
+    --project="$pid" --zone="$zone" --machine-type="$MACHINE" \
+    --image-family="$IMG_FAMILY" --image-project="$IMG_PROJECT" \
+    --tags="$TAG" \
+    --metadata=USR="$SOCKS_USER",PWD="$SOCKS_PASS",PRT="$SOCKS_PORT" \
+    --metadata-from-file startup-script="$sfile" \
+    --quiet >/dev/null || return 1
+
   gcloud compute instances describe "$name" --project="$pid" --zone="$zone" \
     --format="value(networkInterfaces[0].accessConfigs[0].natIP)"
 }
@@ -175,130 +161,171 @@ create_vm(){
 tcp_open(){
   local ip="$1" port="$2" tries="${3:-20}" wait_s="${4:-3}"
   for _ in $(seq 1 "$tries"); do
-    timeout 2 bash -lc ":</dev/tcp/${ip}/${port}" 2>/dev/null && return 0
+    if timeout 2 bash -c ":</dev/tcp/${ip}/${port}" 2>/dev/null; then
+      return 0
+    fi
     sleep "$wait_s"
   done
   return 1
 }
 
 deploy_project(){
-  set -Eeuo pipefail
   local pid="$1"
   say "==== Triển khai cho project: $pid ===="
+  enable_core_apis "$pid" || { say "[$pid] BỎ QUA (chưa có billing hoặc API lỗi)"; return 0; }
+  create_fw "$pid"
 
-  enable_core_apis "$pid" || { telegram_send "Project: ${pid}" "Enable APIs thất bại (thường do billing). Bỏ qua."; return 0; }
-  create_firewall "$pid"
+  # Danh sách 8 VM
+  local VMS=()
+  for i in $(seq 1 "$TOKYO_COUNT"); do VMS+=("proxy-tokyo-$i"); done
+  for i in $(seq 1 "$OSAKA_COUNT"); do VMS+=("proxy-osaka-$i"); done
 
-  # 2 Tokyo + 2 Osaka
-  mapfile -t VMS < <(for i in $(seq 1 "$TOKYO_COUNT"); do echo "proxy-tokyo-$i"; done; \
-                     for i in $(seq 1 "$OSAKA_COUNT"); do echo "proxy-osaka-$i"; done)
+  # Tạo song song VM
+  export -f create_vm
+  export MACHINE IMG_FAMILY IMG_PROJECT TAG SOCKS_USER SOCKS_PASS SOCKS_PORT
+  local tmpfile="/tmp/${pid}_vms.$$.$RANDOM.csv"
+  printf "%s\n" "${VMS[@]}" \
+  | xargs -I{} -P "$VM_PARALLEL" bash -c '
+      PID="$1"; VM="$2"
+      if [[ "$VM" == proxy-tokyo-* ]]; then
+        ZONES=("asia-northeast1-a" "asia-northeast1-b" "asia-northeast1-c")
+      else
+        ZONES=("asia-northeast2-a" "asia-northeast2-b" "asia-northeast2-c")
+      fi
+      ZONE="${ZONES[$RANDOM % ${#ZONES[@]}]}"
+      IP="$(create_vm "$PID" "$VM" "$ZONE" || true)"
+      echo "$VM,$ZONE,$IP"
+    ' _ "$pid" {} >"$tmpfile"
 
-  export -f create_vm tcp_open
-  export MACHINE_TYPE IMAGE_FAMILY IMAGE_PROJECT TAG PROXY_USER PROXY_PASS PORT STARTUP_FILE
+  # Health-check & gửi Telegram
+  local OUT=""; local ok=0; local total=0
+  while IFS=, read -r vm zone ip; do
+    [[ -z "${vm:-}" ]] && continue
+    total=$((total+1))
+    [[ -z "${ip:-}" ]] && continue
+    if tcp_open "$ip" "$SOCKS_PORT"; then
+      OUT+="${ip}:${SOCKS_PORT}:${SOCKS_USER}:${SOCKS_PASS}"$'\n'
+      ok=$((ok+1))
+    fi
+  done < "$tmpfile"
 
-  OUT=()
-  printf "%s\n" "${VMS[@]}" | xargs -I{} -P "$VM_PARALLEL" bash -lc '
-    VM="{}"
-    if [[ "$VM" == proxy-tokyo-* ]]; then ZONES=("asia-northeast1-a" "asia-northeast1-b" "asia-northeast1-c"); else ZONES=("asia-northeast2-a" "asia-northeast2-b" "asia-northeast2-c"); fi
-    ZONE="${ZONES[$RANDOM % ${#ZONES[@]}]}"
-    IP="$(create_vm "'"$pid"'" "$VM" "$ZONE" || true)"
-    echo "$VM,$ZONE,$IP"
-  ' | while IFS=, read -r _vm _zone ip; do
-        [[ -z "$ip" ]] && continue
-        if tcp_open "$ip" "$PORT" 20 3; then
-          OUT+=("${ip}:${PORT}:${PROXY_USER}:${PROXY_PASS}")
-        fi
-     done
-
-  if [[ ${#OUT[@]} -gt 0 ]]; then
-    telegram_send "Project: ${pid}" "$(printf "%s\n" "${OUT[@]}")"
+  if [[ -n "$OUT" ]]; then
+    send_tg "Project: ${pid}" "${OUT%$'\n'}"
   else
-    telegram_send "Project: ${pid}" "Chưa proxy nào mở cổng (có thể do quota hoặc danted chưa ready). Thử lại sau 1–2 phút."
+    send_tg "Project: ${pid}" "Không proxy nào pass health-check (có thể quota/propagate; thử lại sau)."
   fi
+  say "[$pid] Tổng: $total ; Healthy: $ok"
 }
 
-create_project_and_link(){
-  local base="$1"
-  local id="$(sanitize_id "${BASE_PREFIX}${base}-$(rand_suffix)")"
-  say "Tạo project: $id"
-  gcloud projects create "$id" --labels="$LABELS" --quiet
-  # bật cloudapis để link billing
-  gcloud services enable cloudapis.googleapis.com --project="$id" --quiet || true
-  if link_billing_safe "$id"; then
-    echo "$id"
-  else
-    # không link được billing ⇒ xoá cho sạch tránh lẫn
-    say "[$id] Xoá project vì không link được billing."
-    gcloud projects delete "$id" --quiet || true
-    echo ""
-  fi
+########################
+# QUẢN LÝ PROJECTS & BILLING
+########################
+get_default_project(){
+  gcloud config get-value project 2>/dev/null || true
 }
 
-########################################
-# XÁC ĐỊNH BỘ 3 PROJECT MỤC TIÊU
-########################################
-say "BẮT ĐẦU: tự cân nhắc 2 hay 3 project + tránh lỗi billing/quota; tạo proxy & gửi Telegram."
+has_billing(){
+  local pid="$1"
+  gcloud beta billing projects describe "$pid" --format="value(billingEnabled)" 2>/dev/null \
+    | grep -qi '^true$'
+}
 
-# Project mặc định + billing?
-CURR_PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
-DEFAULT_OK=false
-if [[ -n "$CURR_PROJECT" ]] && billing_enabled "$CURR_PROJECT"; then
-  DEFAULT_OK=true
-  say "✓ Project mặc định có billing: $CURR_PROJECT"
-else
-  say "ℹ️  Project mặc định KHÔNG có billing hoặc chưa set."
-fi
+ensure_projects_with_billing(){
+  # Trả ra danh sách project để deploy (tối đa TARGET_PROJECTS), ưu tiên project đã có billing
+  local desired="$1" ; shift || true
+  local default_proj; default_proj="$(get_default_project)"
+  [[ -n "$default_proj" ]] && has_billing "$default_proj" && say "✓ Project mặc định có billing: $default_proj"
 
-# Các socks-proj-* hiện có
-mapfile -t EXIST < <(gcloud projects list --format="value(projectId)" | grep "^${BASE_PREFIX}" || true)
+  # Lấy các project “socks-proj-*” & mọi project khả dụng
+  mapfile -t all < <(gcloud projects list --format="value(projectId)" 2>/dev/null || true)
+  [[ ${#all[@]} -eq 0 ]] && { echo ""; return 0; }
 
-# Lọc các project có billing
-TARGETS=()
-if $DEFAULT_OK; then TARGETS+=("$CURR_PROJECT"); fi
-for p in "${EXIST[@]:-}"; do
-  billing_enabled "$p" && TARGETS+=("$p")
-done
+  # Lọc những project đã có billing
+  local bill_ok=()
+  for p in "${all[@]}"; do
+    if has_billing "$p"; then bill_ok+=("$p"); fi
+  done
 
-# Nếu đã đủ 3 thì dừng ở đây (không tạo thêm)
-if [[ ${#TARGETS[@]} -ge 3 ]]; then
-  say "✓ Đã có ≥3 project có billing: ${TARGETS[*]}"
-else
-  ensure_billing_account
-  # cần bổ sung đến đủ 3
-  NEED=$((3 - ${#TARGETS[@]}))
-  if [[ $NEED -gt 0 ]]; then
-    # nếu default không dùng được, có thể sẽ tạo 3
-    for i in $(seq 1 "$NEED"); do
-      NEWID="$(create_project_and_link "auto-$i")"
-      [[ -n "$NEWID" ]] && TARGETS+=("$NEWID")
+  # Ưu tiên lấy default nếu có billing
+  local selected=()
+  if [[ -n "$default_proj" ]] && has_billing "$default_proj"; then
+    selected+=("$default_proj")
+  fi
+  # Thêm các socks-proj-* có billing
+  for p in "${bill_ok[@]}"; do
+    [[ "$p" == "$default_proj" ]] && continue
+    if [[ "$p" == "$BASE_PREFIX"* ]]; then
+      selected+=("$p")
+    fi
+  done
+  # Nếu thiếu, thêm các project khác có billing
+  if [[ ${#selected[@]} -lt $desired ]]; then
+    for p in "${bill_ok[@]}"; do
+      [[ " ${selected[*]} " == *" $p "* ]] && continue
+      selected+=("$p")
+      [[ ${#selected[@]} -ge $desired ]] && break
     done
   fi
+
+  # Nếu vẫn < desired ⇒ tạo thêm project mới & link billing nếu còn quota
+  if [[ ${#selected[@]} -lt $desired ]]; then
+    say "Cần tạo thêm $((desired - ${#selected[@]})) project…"
+    # Lấy billing account OPEN đầu tiên
+    local BA; BA="$(gcloud billing accounts list --format='value(ACCOUNT_ID)' --filter='OPEN=True' 2>/dev/null | head -n1 || true)"
+    if [[ -z "$BA" ]]; then
+      say "⚠️  Không tìm thấy Billing Account OPEN. Chỉ dùng các project đã có billing."
+    fi
+    local need=$((desired - ${#selected[@]}))
+    for i in $(seq 1 "$need"); do
+      local randsuf; randsuf="$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)"
+      local nid="${BASE_PREFIX}-${randsuf}-err-died-at"
+      say "Tạo project: $nid"
+      gcloud projects create "$nid" --quiet || continue
+      # bật cloudapis trước khi link billing (thường gcloud tự làm, nhưng cho chắc)
+      gcloud services enable cloudapis.googleapis.com --project="$nid" --quiet || true
+      if [[ -n "$BA" ]]; then
+        if gcloud beta billing projects link "$nid" --billing-account="$BA" --quiet; then
+          selected+=("$nid")
+        else
+          say "⚠️  Link billing thất bại (hết quota?) cho $nid — bỏ qua."
+        fi
+      fi
+    done
+  fi
+
+  # Cắt đúng desired & unique
+  awk -v n="$desired" '{
+    if(!seen[$0]++){ print $0; c++ }
+    if (c>=n) exit
+  }' < <(printf "%s\n" "${selected[@]}") || true
+}
+
+########################
+# MAIN
+########################
+say "BẮT ĐẦU: tự cân nhắc 2 hay 3 project + tránh lỗi billing/quota; tạo proxy & gửi Telegram."
+
+# Nếu người dùng chỉ định PROJECTS sẵn thì dùng luôn:
+if [[ -n "${PROJECTS:-}" ]]; then
+  mapfile -t TARGETS < <(printf "%s\n" ${PROJECTS})
+else
+  mapfile -t TARGETS < <(ensure_projects_with_billing "$TARGET_PROJECTS")
 fi
 
-# Nếu vì quota billing mà <3, ta vẫn deploy trên những project có billing
 if [[ ${#TARGETS[@]} -eq 0 ]]; then
-  say "❌ Không có project nào có billing. Kết thúc."
+  say "⚠️  Không có project nào sẵn sàng (có billing). Dừng."
   exit 0
 fi
+say "Triển khai cho: ${TARGETS[*]}"
 
-# Loại trùng + giới hạn 3
-# (giữ nguyên thứ tự: ưu tiên default (nếu có) + các socks-proj- đã có + mới tạo)
-CLEAN=()
-for p in "${TARGETS[@]}"; do
-  [[ " ${CLEAN[*]-} " == *" $p "* ]] || CLEAN+=("$p")
-done
-while [[ ${#CLEAN[@]} -gt 3 ]]; do CLEAN=("${CLEAN[@]:0:3}"); done
+# Chạy song song giữa các PROJECT
+export -f deploy_project enable_core_apis create_fw tcp_open create_vm startup_script_file send_tg
+export MACHINE IMG_FAMILY IMG_PROJECT TAG SOCKS_USER SOCKS_PASS SOCKS_PORT TOKYO_COUNT OSAKA_COUNT VM_PARALLEL BOT_TOKEN USER_ID
 
-say "Triển khai cho: ${CLEAN[*]}"
-
-########################################
-# TRIỂN KHAI
-########################################
-export -f enable_core_apis create_firewall deploy_project tcp_open create_vm
-export MACHINE_TYPE IMAGE_FAMILY IMAGE_PROJECT TAG PROXY_USER PROXY_PASS PORT TOKYO_COUNT OSAKA_COUNT VM_PARALLEL STARTUP_FILE
-
-for pid in "${CLEAN[@]}"; do
-  deploy_project "$pid"
-done
+printf "%s\n" "${TARGETS[@]}" \
+| xargs -I{} -P "${PROJECT_PARALLEL}" bash -c '
+  PID="$1"
+  deploy_project "$PID"
+' _ {}
 
 say "HOÀN TẤT."
