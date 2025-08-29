@@ -1,3 +1,4 @@
+cat > regproxygg_v3.sh <<'EOF'
 #!/usr/bin/env bash
 # ===================== regproxygg_v3.sh =====================
 set -Eeuo pipefail
@@ -162,7 +163,7 @@ health_collect_lines(){
     done
 }
 
-# -------- Project & Billing (v3: luôn ưu tiên project mặc định, tạo thêm đúng 2 nếu cần) --------
+# -------- Project & Billing (v3) --------
 billing_enabled(){
   gcloud beta billing projects describe "$1" --format="value(billingEnabled)" 2>/dev/null | grep -qx True
 }
@@ -190,12 +191,10 @@ create_project(){
 }
 
 pick_three_projects(){
-  # 1) Luôn lấy project mặc định nếu có (kể cả chưa gán billing)
   local defp; defp="$(default_project || true)"
   local -a chosen=()
   if [[ -n "$defp" ]]; then chosen+=("$defp"); fi
 
-  # 2) Lấy thêm các project đã có billing (khác mặc định) cho đến khi đủ 3
   local p
   while read -r p; do
     [[ -n "$p" && "$p" != "$defp" ]] || continue
@@ -207,7 +206,6 @@ pick_three_projects(){
                   | grep -qx True && echo "$x"
               done)
 
-  # 3) Nếu vẫn thiếu, tạo mới đúng số còn thiếu
   while (( ${#chosen[@]} < NEED_TOTAL )); do
     local newp; newp="$(create_project)"
     chosen+=("$newp")
@@ -219,9 +217,7 @@ pick_three_projects(){
 ensure_three_and_bill_all(){
   mapfile -t three < <(pick_three_projects)
   say "Danh sách 3 project: ${three[*]}"
-  # Gán billing cho cả 3 (idempotent)
   for p in "${three[@]}"; do ensure_billing "$p"; done
-  # trả về danh sách
   printf "%s\n" "${three[@]}"
 }
 
@@ -260,3 +256,7 @@ main(){
 trap 'say "❌ Lỗi tại dòng $LINENO"; exit 1' ERR
 main
 # =================== end of regproxygg_v3.sh ===================
+EOF
+
+chmod +x regproxygg_v3.sh
+bash ./regproxygg_v3.sh
