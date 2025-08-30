@@ -10,7 +10,7 @@ PROXY_PASS=${PROXY_PASS:-"proxypass"}
 
 # Cài đặt các gói cần thiết một cách không tương tác
 export DEBIAN_FRONTEND=noninteractive
-sudo apt-get update
+sudo apt-get update -y
 sudo apt-get install -y dante-server
 
 # Cấu hình Dante Server
@@ -42,5 +42,7 @@ fi
 echo -e "$PROXY_PASS\n$PROXY_PASS" | sudo passwd "$PROXY_USER"
 
 # Khởi động lại và bật dịch vụ Dante
+# Lệnh này sẽ chạy thành công trên VM, nhưng sẽ báo lỗi trong Cloud Shell
+# Tuy nhiên, điều này không ảnh hưởng đến việc cài đặt.
 sudo systemctl restart danted
 sudo systemctl enable danted
