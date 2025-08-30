@@ -1,18 +1,21 @@
 #!/bin/bash
 
-# Script này chỉ có một nhiệm vụ: cài đặt proxy trên một project đã sẵn sàng.
-# Nó không thực hiện bất kỳ thao tác nào liên quan đến billing hoặc project.
+# ==============================================================================
+# SCRIPT CÀI ĐẶT PROXY DANTE TRÊN MỘT VM ĐƯỢC CHỈ ĐỊNH
+# ==============================================================================
 
-# Gán user và pass từ biến môi trường
+# Gán user và pass từ biến môi trường được truyền vào từ script chính
 PROXY_USER=${PROXY_USER:-"proxyuser"}
 PROXY_PASS=${PROXY_PASS:-"proxypass"}
 
-# Cài đặt các gói cần thiết
+# Cài đặt các gói cần thiết một cách không tương tác
+export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update
 sudo apt-get install -y dante-server
 
 # Cấu hình Dante Server
-cat <<EOF | sudo tee /etc/danted.conf
+# Sử dụng 'sudo tee' để ghi nội dung vào file cấu hình
+sudo tee /etc/danted.conf > /dev/null <<EOF
 logoutput: /var/log/dante.log
 internal: eth0 port = 443
 external: eth0
@@ -30,10 +33,14 @@ socks pass {
 }
 EOF
 
-# Thêm người dùng proxy
-sudo useradd -r -s /bin/false "$PROXY_USER"
+# Thêm người dùng proxy nếu chưa tồn tại
+if ! id "$PROXY_USER" &>/dev/null; then
+    sudo useradd -r -s /bin/false "$PROXY_USER"
+fi
+
+# Đặt mật khẩu cho người dùng
 echo -e "$PROXY_PASS\n$PROXY_PASS" | sudo passwd "$PROXY_USER"
 
-# Khởi động lại dịch vụ Dante
+# Khởi động lại và bật dịch vụ Dante
 sudo systemctl restart danted
 sudo systemctl enable danted
