@@ -1,13 +1,14 @@
 #!/bin/bash
 # =====================================================================
-# GCP SOCKS5 FARM v4.2 (prefer default project; reach 3 projects)
-# - Tự chuẩn hoá project sẵn có (billing/API/quyền), đủ 3 thì tạo proxy
-# - Nếu thiếu → tạo thêm project, link billing, bật API, cấp quyền
-# - Thêm: --list-billing để liệt kê billing accounts
-# - Khi thiếu billing, tự in bảng billing trước khi thoát
+# GCP SOCKS5 FARM v4.3 (auto-discover & auto-link Billing; reach 3 projects)
+# - Ưu tiên project mặc định; bổ sung project sẵn có; thiếu thì tạo mới
+# - TỰ DÒ Billing Account từ: env -> default project -> mọi project -> list(open)
+# - Mỗi project: 8 VM (4 Tokyo + 4 Osaka), Dante SOCKS5 (mr.quang/2703, port 1080)
+# - Idempotent: skip VM trùng tên; chuẩn hoá quyền & API trên project có sẵn
+# - Output: ip:port:user:pass
 # =====================================================================
 
-set -u  # không set -e để tránh rớt shell
+set -u  # tránh rớt shell vì lỗi vặt
 PREFIX="proxygen"
 NEED=3
 TOKYO_ZONE="asia-northeast1-a"
@@ -16,7 +17,7 @@ PROXY_USER="mr.quang"
 PROXY_PASS="2703"
 PROXY_PORT="1080"
 FIREWALL_NAME="allow-socks5-1080"
-: "${BILLING_ACCOUNT_ID:=}"   # ví dụ: BILLING_ACCOUNT_ID="000000-AAAAAA-BBBBBB"
+: "${BILLING_ACCOUNT_ID:=}"   # có thể bỏ trống, script sẽ tự dò
 
 say(){ echo -e "[ $(date '+%F %T') ] $*"; }
 warn(){ echo -e "[WARN] $*" >&2; }
@@ -30,10 +31,11 @@ default_project(){ gcloud config get-value core/project 2>/dev/null | tr -d '\r'
 project_has_billing(){ gcloud beta billing projects describe "$1" --format="value(billingEnabled)" 2>/dev/null | grep -q "^True$"; }
 project_billing_account(){ gcloud beta billing projects describe "$1" --format="value(billingAccountName)" 2>/dev/null; }
 pick_open_billing(){ gcloud beta billing accounts list --filter="open=true" --format="value(name)" 2>/dev/null | head -n1; }
-list_billing_accounts(){  # <<== MỚI
-  say "== Billing accounts (open status) =="
-  gcloud beta billing accounts list --format='table(name, displayName, open)' 2>/dev/null \
-    || warn "Không liệt kê được billing accounts (thiếu quyền?)."
+list_billing_accounts(){ gcloud beta billing accounts list --format='table(name,displayName,open)' 2>/dev/null || true; }
+
+normalize_billing_id(){
+  # Chuyển "billingAccounts/000000-AAAAAA-BBBBBB" -> "000000-AAAAAA-BBBBBB"
+  local x="${1:-}"; x="${x##billingAccounts/}"; echo "$x"
 }
 
 enable_apis(){
@@ -74,7 +76,38 @@ ensure_firewall(){
     --target-tags="socks5" --quiet >/dev/null 2>&1 || warn "[$pid] tạo firewall lỗi (bỏ qua)."
 }
 
-# Startup script (Dante)
+# ---- TỰ DÒ billing từ mọi nguồn có thể ----
+discover_billing_from_projects(){
+  local names=() line pid enabled acct
+  gcloud projects list --format='value(projectId)' 2>/dev/null \
+  | while read -r pid; do
+      [[ -z "$pid" ]] && continue
+      enabled="$(gcloud beta billing projects describe "$pid" --format='value(billingEnabled)' 2>/dev/null || true)"
+      [[ "$enabled" != "True" ]] && continue
+      acct="$(gcloud beta billing projects describe "$pid" --format='value(billingAccountName)' 2>/dev/null || true)"
+      [[ -n "$acct" ]] && echo "$acct"
+    done \
+  | awk '!seen[$0]++'
+}
+
+choose_billing_candidates(){
+  # In ra danh sách ứng viên billing (mỗi dòng 1 cái), theo ưu tiên mạnh -> yếu
+  local DEF="$1"
+  # 1) env
+  if [[ -n "${BILLING_ACCOUNT_ID:-}" ]]; then
+    echo "$(normalize_billing_id "$BILLING_ACCOUNT_ID")"
+  fi
+  # 2) default project
+  if [[ -n "$DEF" && "$(project_has_billing "$DEF" && echo yes || echo no)" == "yes" ]]; then
+    project_billing_account "$DEF"
+  fi
+  # 3) từ các project khác
+  discover_billing_from_projects
+  # 4) list(open) nếu có quyền
+  pick_open_billing
+}
+
+# ---- Startup Script (Dante) ----
 SS_FILE="/tmp/startup_socks5.sh"
 cat >"$SS_FILE" <<'EOS'
 #!/bin/bash
@@ -109,14 +142,28 @@ EOS
 chmod +x "$SS_FILE" || true
 
 create_projects_to_reach_three(){
-  local target_bill="$1"; local need_more="$2"; local created=()
+  # $1: danh sách candidates (nhiều dòng), $2: số cần tạo
+  local candidates="$1"; local need_more="$2"; local created=()
   [[ "$need_more" -le 0 ]] && { echo ""; return 0; }
+
   for i in $(seq 1 "$need_more"); do
     local pid="${PREFIX}-$(date +%s)$RANDOM"
     say "[create $i/$need_more] tạo project: $pid"
     gcloud projects create "$pid" --name="$pid" --quiet >/dev/null || { err "Tạo project lỗi: $pid"; exit 1; }
-    say "[create] link billing: $target_bill"
-    gcloud beta billing projects link "$pid" --billing-account="$target_bill" --quiet >/dev/null || { err "Link billing lỗi: $pid"; exit 1; }
+
+    # thử link billing lần lượt cho đến khi thành công
+    local ok=0 acct norm
+    while read -r acct; do
+      [[ -z "$acct" ]] && continue
+      norm="$(normalize_billing_id "$acct")"
+      say "[create] thử link billing: $norm"
+      if gcloud beta billing projects link "$pid" --billing-account="$norm" --quiet >/dev/null 2>&1; then
+        ok=1; break
+      fi
+    done <<< "$candidates"
+
+    [[ "$ok" -eq 1 ]] || { err "Không link billing được cho $pid (không có quyền hoặc không có billing)."; exit 1; }
+
     say "[create] bật API"; enable_apis "$pid"
     say "[create] cấp quyền cho $(active_acct)"; grant_roles "$pid"
     created+=("$pid")
@@ -166,16 +213,11 @@ batch_project(){
   } >"$lg" 2>&1
 }
 
-# ==== FLAGS ====
-ACTION="auto"  # auto|create
-if [[ "${1:-}" == "--create" ]]; then ACTION="create"; shift; fi
-if [[ "${1:-}" == "--list-billing" ]]; then list_billing_accounts; exit 0; fi  # <<== MỚI
-
 # ================= MAIN =================
 say "Active account: $(active_acct || echo none)"
 DEF="$(default_project || true)"
 
-# (A) Tập ứng viên: default trước, rồi ưu tiên PREFIX, rồi phần còn lại
+# (A) danh sách candidate project: default -> prefix -> phần còn lại
 CAND=()
 [[ -n "$DEF" ]] && CAND+=("$DEF")
 ALL="$(gcloud projects list --format='value(projectId)' 2>/dev/null)"
@@ -186,7 +228,7 @@ while read -r p; do
 done <<< "$ALL"
 CAND+=("${PRIORITY[@]}" "${OTHERS[@]}")
 
-# (B) Chuẩn hoá & chọn đủ 3 project sẵn có
+# (B) chuẩn hoá & chọn đủ 3 project sẵn có
 PICK=()
 for pid in "${CAND[@]}"; do
   prepare_existing_project "$pid" || true
@@ -195,31 +237,25 @@ for pid in "${CAND[@]}"; do
   [[ ${#PICK[@]} -ge $NEED ]] && break
 done
 
-# (C) Nếu thiếu → tạo thêm cho đủ 3
+# (C) nếu thiếu → tự DÒ billing candidates → tạo thêm cho đủ 3
 if [[ ${#PICK[@]} -lt $NEED ]]; then
-  BILL_ACCT=""
-  if [[ -n "${BILLING_ACCOUNT_ID:-}" ]]; then
-    BILL_ACCT="$BILLING_ACCOUNT_ID"
-  else
-    [[ -n "$DEF" && "$(project_has_billing "$DEF" && echo yes || echo no)" == "yes" ]] && BILL_ACCT="$(project_billing_account "$DEF")"
-    [[ -z "$BILL_ACCT" ]] && BILL_ACCT="$(pick_open_billing)"
-  fi
-
-  if [[ -z "$BILL_ACCT" ]]; then
-    err "Không tìm thấy Billing Account. Hãy set BILLING_ACCOUNT_ID hoặc bật billing cho project mặc định."
-    list_billing_accounts   # <<== In bảng billing trước khi thoát
+  say "Đang tự dò Billing Accounts…"
+  CAND_BILL="$(choose_billing_candidates "$DEF" | awk 'NF' | awk '!seen[$0]++')"
+  if [[ -z "${CAND_BILL:-}" ]]; then
+    err "Không tìm thấy Billing Account nào từ env/default project/projects/list(open)). Bạn có thể thiếu quyền Billing Viewer."
+    say "Gợi ý billing hiện có (nếu xem được):"
+    list_billing_accounts || true
     exit 1
   fi
-
   NEED_MORE=$(( NEED - ${#PICK[@]} ))
-  say "Đang tạo thêm $NEED_MORE project (billing: $BILL_ACCT) cho đủ $NEED…"
-  read -r -a CREATED <<<"$(create_projects_to_reach_three "$BILL_ACCT" "$NEED_MORE")"
+  say "Sẽ tạo thêm $NEED_MORE project, thử lần lượt các billing tìm được…"
+  read -r -a CREATED <<<"$(create_projects_to_reach_three "$CAND_BILL" "$NEED_MORE")"
   PICK+=("${CREATED[@]}")
 fi
 
 say "Dùng 3 project: ${PICK[*]}"
 
-# (D) Tạo proxy song song
+# (D) tạo proxy song song
 for pid in "${PICK[@]}"; do batch_project "$pid" & done
 wait
 
