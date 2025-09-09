@@ -1,12 +1,11 @@
 #!/bin/bash
 # =====================================================================
-# GCP SOCKS5 FARM v4.5
-# - Tự động dùng tối đa 3 projects (ưu tiên sẵn có, thiếu sẽ tự tạo & link billing)
+# GCP SOCKS5 FARM v4.6
+# - Tối đa 3 projects (ưu tiên sẵn có; thiếu tự tạo & link billing)
 # - Mỗi project: 8 VM (4 Tokyo + 4 Osaka) = 24 proxy
-# - Debian 12 + Dante đúng cú pháp (socksmethod + socks pass; bind trên IFACE thật)
-# - Username/Password/Port: mr.quang / 2703 / 1080
-# - Firewall theo tag "socks5"
-# - Log an toàn theo projectId: /tmp/<projectId>.log
+# - Debian 12 + Dante bind theo IFACE thật (không dùng 0.0.0.0 cho external)
+# - VPC tự tạo: socks-vpc (auto subnet) + firewall theo tag "socks5"
+# - Tất cả log theo project: /tmp/<projectId>.log
 # =====================================================================
 
 set -u
@@ -18,6 +17,7 @@ PROXY_USER="mr.quang"
 PROXY_PASS="2703"
 PROXY_PORT="1080"
 FIREWALL_NAME="allow-socks5-1080"
+NETWORK_NAME="socks-vpc"
 : "${BILLING_ACCOUNT_ID:=}"   # có thể để trống; script sẽ tự dò
 
 say(){ echo -e "[ $(date '+%F %T') ] $*"; }
@@ -33,7 +33,6 @@ project_has_billing(){ gcloud beta billing projects describe "$1" --format="valu
 project_billing_account(){ gcloud beta billing projects describe "$1" --format="value(billingAccountName)" 2>/dev/null; }
 pick_open_billing(){ gcloud beta billing accounts list --filter="open=true" --format="value(name)" 2>/dev/null | head -n1; }
 list_billing_accounts(){ gcloud beta billing accounts list --format='table(name,displayName,open)' 2>/dev/null || true; }
-
 normalize_billing_id(){ local x="${1:-}"; x="${x##billingAccounts/}"; echo "$x"; }
 
 enable_apis(){
@@ -65,12 +64,24 @@ check_project_ready(){
   gcloud compute instances list --project="$pid" --limit=1 --quiet >/dev/null 2>&1 || return 1
   return 0
 }
+
+ensure_network(){
+  local pid="$1"
+  # Tạo VPC auto subnet nếu chưa có
+  gcloud compute networks describe "$NETWORK_NAME" --project="$pid" --quiet >/dev/null 2>&1 && return 0
+  say "[$pid] tạo network $NETWORK_NAME (auto subnet)…"
+  gcloud compute networks create "$NETWORK_NAME" \
+    --project="$pid" --subnet-mode=auto --bgp-routing-mode=regional --quiet >/dev/null 2>&1 || true
+}
+
 ensure_firewall(){
   local pid="$1"
   gcloud compute firewall-rules describe "$FIREWALL_NAME" --project="$pid" --quiet >/dev/null 2>&1 && return 0
+  say "[$pid] tạo firewall $FIREWALL_NAME…"
   gcloud compute firewall-rules create "$FIREWALL_NAME" \
     --project="$pid" --allow="tcp:${PROXY_PORT}" \
-    --direction=INGRESS --priority=1000 --network=default \
+    --direction=INGRESS --priority=1000 \
+    --network="$NETWORK_NAME" \
     --target-tags="socks5" --quiet >/dev/null 2>&1 || warn "[$pid] tạo firewall lỗi (bỏ qua)."
 }
 
@@ -87,9 +98,7 @@ discover_billing_from_projects(){
 
 choose_billing_candidates(){
   local DEF="$1"
-  if [[ -n "${BILLING_ACCOUNT_ID:-}" ]]; then
-    echo "$(normalize_billing_id "$BILLING_ACCOUNT_ID")"
-  fi
+  [[ -n "${BILLING_ACCOUNT_ID:-}" ]] && echo "$(normalize_billing_id "$BILLING_ACCOUNT_ID")"
   if [[ -n "$DEF" ]]; then
     project_has_billing "$DEF" && project_billing_account "$DEF"
   fi
@@ -118,13 +127,13 @@ echo "${USER_NAME}:${USER_PASS}" | chpasswd || true
 IFACE="$(ip -o -4 route show to default 2>/dev/null | awk '{print $5}' | head -n1)"
 [ -z "$IFACE" ] && IFACE="ens4"
 
-# Bật START=yes theo kiểu Debian/Ubuntu
+# Bật START=yes theo Debian
 cat >/etc/default/danted <<EOCFG
 START=yes
 CONFIGFILE=/etc/danted.conf
 EOCFG
 
-# Cấu hình Dante: KHÔNG dùng 0.0.0.0 cho external
+# Cấu hình Dante (bind đúng IFACE)
 cat >/etc/danted.conf <<EOC
 logoutput: syslog
 internal: ${IFACE} port = ${PORT}
@@ -142,18 +151,14 @@ socks pass {
 }
 EOC
 
-# Bật service
 systemctl enable danted || true
 systemctl restart danted || systemctl start danted || true
 
-# Mở cổng nội bộ (iptables)
 iptables -I INPUT -p tcp --dport ${PORT} -j ACCEPT 2>/dev/null || true
 
-# Ghi IP ra file để debug nhanh
 EXT_IP="$(curl -s --max-time 5 ifconfig.me || hostname -I | awk '{print $1}')"
 echo "${EXT_IP}:${PORT}:${USER_NAME}:${USER_PASS}" >/root/_proxy.txt 2>/dev/null || true
 
-# Tuỳ chọn: gửi Telegram nếu set BOT_TOKEN/USER_ID (export trước khi tạo VM)
 if [ -n "${BOT_TOKEN:-}" ] && [ -n "${USER_ID:-}" ]; then
   curl -fsS "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
     --data-urlencode "chat_id=${USER_ID}" \
@@ -165,12 +170,10 @@ chmod +x "$SS_FILE" || true
 create_projects_to_reach_three(){
   local candidates="$1"; local need_more="$2"; local created=()
   [[ "$need_more" -le 0 ]] && { echo ""; return 0; }
-
   for i in $(seq 1 "$need_more"); do
     local pid="${PREFIX}-$(date +%s)$RANDOM"
     say "[create $i/$need_more] tạo project: $pid"
     gcloud projects create "$pid" --name="$pid" --quiet >/dev/null || { err "Tạo project lỗi: $pid"; exit 1; }
-
     local ok=0 acct norm
     while read -r acct; do
       [[ -z "$acct" ]] && continue
@@ -180,9 +183,7 @@ create_projects_to_reach_three(){
         ok=1; break
       fi
     done <<< "$candidates"
-
     [[ "$ok" -eq 1 ]] || { err "Không link billing được cho $pid."; exit 1; }
-
     say "[create] bật API"; enable_apis "$pid"
     say "[create] cấp quyền cho $(active_acct)"; grant_roles "$pid"
     created+=("$pid")
@@ -194,14 +195,16 @@ create_vm(){
   local pid="$1" name="$2" zone="$3"
   gcloud compute instances describe "$name" --zone="$zone" --project="$pid" --quiet >/dev/null 2>&1 && {
     say "[$pid] $name đã tồn tại → skip"; return 0; }
+  # Không ẩn stderr/stdout: để log dự án thấy lỗi nếu có (VD: không có default network)
   gcloud compute instances create "$name" \
     --project="$pid" --zone="$zone" --machine-type="e2-micro" \
     --image-family="debian-12" --image-project="debian-cloud" \
     --boot-disk-size="10GB" --boot-disk-type="pd-balanced" \
     --tags="socks5" \
+    --network="$NETWORK_NAME" \
     --metadata=enable-oslogin=true \
     --metadata-from-file=startup-script="$SS_FILE" \
-    --quiet >/dev/null 2>&1 || { warn "[$pid] tạo VM lỗi: $name"; return 1; }
+    --quiet
 }
 
 batch_project(){
@@ -210,7 +213,8 @@ batch_project(){
     say "[$pid] chuẩn hoá quyền & API…"; prepare_existing_project "$pid" || true
     say "[$pid] kiểm tra điều kiện…"
     if ! check_project_ready "$pid"; then err "[$pid] chưa sẵn sàng (billing/API/quyền). Bỏ qua."; exit 1; fi
-    say "[$pid] firewall…"; ensure_firewall "$pid"
+    ensure_network "$pid"
+    ensure_firewall "$pid"
     say "[$pid] tạo 4 Tokyo + 4 Osaka…"
     create_vm "$pid" "proxy-tokyo-1" "$TOKYO_ZONE" &
     create_vm "$pid" "proxy-tokyo-2" "$TOKYO_ZONE" &
@@ -221,7 +225,7 @@ batch_project(){
     create_vm "$pid" "proxy-osaka-3" "$OSAKA_ZONE" &
     create_vm "$pid" "proxy-osaka-4" "$OSAKA_ZONE" &
     wait
-    say "[$pid] chờ IP (40s)…"; sleep 40
+    say "[$pid] chờ IP (45s)…"; sleep 45
     say "[$pid] PROXY:"
     gcloud compute instances list \
       --project="$pid" \
@@ -247,7 +251,7 @@ while read -r p; do
 done <<< "$ALL"
 CAND+=("${PRIORITY[@]}" "${OTHERS[@]}")
 
-# (B) lấy đủ tối đa 3 project sẵn sàng
+# (B) lấy tối đa 3 project sẵn sàng
 PICK=()
 for pid in "${CAND[@]}"; do
   prepare_existing_project "$pid" || true
